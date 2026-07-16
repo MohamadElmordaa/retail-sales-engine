@@ -1,4 +1,9 @@
-import { Injectable, Logger, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
+import {
+  Injectable,
+  Logger,
+  OnModuleInit,
+  OnModuleDestroy,
+} from '@nestjs/common';
 import { PrismaPg } from '@prisma/adapter-pg';
 import { PrismaClient } from '../generated/prisma/client';
 
@@ -10,13 +15,18 @@ import { PrismaClient } from '../generated/prisma/client';
 // those are for edge runtimes that can't hold a socket. Neon stays a deployment detail,
 // so DATABASE_URL can point at Neon, a local Postgres, or a colleague's box unchanged.
 @Injectable()
-export class PrismaService extends PrismaClient implements OnModuleInit, OnModuleDestroy {
+export class PrismaService
+  extends PrismaClient
+  implements OnModuleInit, OnModuleDestroy
+{
   private readonly logger = new Logger(PrismaService.name);
 
   constructor() {
     const connectionString = process.env.DATABASE_URL;
     if (!connectionString) {
-      throw new Error('DATABASE_URL is not set. Copy .env.example to .env and fill it in.');
+      throw new Error(
+        'DATABASE_URL is not set. Copy .env.example to .env and fill it in.',
+      );
     }
     super({ adapter: new PrismaPg({ connectionString }) });
   }
