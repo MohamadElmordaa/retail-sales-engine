@@ -1,21 +1,28 @@
-import { NotFoundException } from '@nestjs/common';
+import { HttpException } from '@nestjs/common';
 import { Prisma } from '../generated/prisma/client';
 import type { PrismaService } from '../prisma/prisma.service';
 import type { FxService } from '../fx/fx.service';
 import { SalesService } from './sales.service';
 import type { CreateSaleDto } from './dto/create-sale.dto';
 
-// Write payloads captured off the mocked $transaction so tests can assert that the
-// receipt reconciles against exactly what the service persisted (Decimals, not strings).
+// Write payloads captured off the mocked $transaction so tests can assert what the service
+// persisted (Decimals, matched flags, scan rows) without touching a database.
 interface CapturedTransaction {
   totalBase: Prisma.Decimal;
 }
 interface CapturedLineItem {
+  id: string;
+  productId: string | null;
+  isUnmatched: boolean;
+  rawBarcode: string;
   lineTotalBase: Prisma.Decimal;
 }
+interface CapturedScan {
+  rawBarcode: string;
+  lineItemId: string | null;
+  transactionId: string | null;
+}
 
-// Only the surface SalesService touches — cast to the real types at construction so the
-// service is exercised unchanged while the mocks keep their jest.Mock control methods.
 interface PrismaMock {
   store: { findUnique: jest.Mock };
   user: { findUnique: jest.Mock };
@@ -26,10 +33,21 @@ interface PrismaMock {
 interface TxMock {
   transaction: { create: jest.Mock };
   transactionLineItem: { createMany: jest.Mock };
+  unmatchedBarcodeScan: { createMany: jest.Mock };
 }
 interface FxMock {
   getBaseCurrency: jest.Mock;
   getRate: jest.Mock;
+}
+
+// Await a rejection and hand back the HttpException so its status/code can be asserted.
+async function caught(promise: Promise<unknown>): Promise<HttpException> {
+  try {
+    await promise;
+  } catch (error) {
+    return error as HttpException;
+  }
+  throw new Error('Expected the promise to reject, but it resolved.');
 }
 
 // Mocked Prisma + Fx — these tests must pass with no database.
@@ -39,6 +57,7 @@ describe('SalesService', () => {
   let fx: FxMock;
   let createdData: CapturedTransaction | undefined;
   let lineItemsData: CapturedLineItem[];
+  let scanData: CapturedScan[];
 
   const baseDto: CreateSaleDto = {
     storeCode: 'STR-001',
@@ -53,6 +72,7 @@ describe('SalesService', () => {
   beforeEach(() => {
     createdData = undefined;
     lineItemsData = [];
+    scanData = [];
     prisma = {
       store: {
         findUnique: jest.fn().mockResolvedValue({
@@ -105,6 +125,14 @@ describe('SalesService', () => {
                   },
                 ),
             },
+            unmatchedBarcodeScan: {
+              createMany: jest
+                .fn()
+                .mockImplementation(({ data }: { data: CapturedScan[] }) => {
+                  scanData = data;
+                  return { count: data.length };
+                }),
+            },
           };
           return cb(tx);
         }),
@@ -131,6 +159,7 @@ describe('SalesService', () => {
     expect(receipt.totals.totalBase).not.toBe(receipt.totals.total);
     expect(receipt.currency.fxRate).toBe('1.08420000');
     expect(receipt.currency.baseCode).toBe('USD');
+    expect(receipt.warnings).toEqual([]);
 
     // Reconciliation: SUM(line_total_base) === transaction.total_base
     const sumBase = lineItemsData.reduce(
@@ -157,10 +186,86 @@ describe('SalesService', () => {
     expect(receipt.totals.totalBase).toBe(receipt.totals.total);
   });
 
-  it('throws 404 when a barcode matches no product', async () => {
-    prisma.product.findMany.mockResolvedValue([]);
-    await expect(service.create(baseDto)).rejects.toBeInstanceOf(
-      NotFoundException,
+  it('unknown barcode: sale completes (201), line is flagged, scan row is logged, FX still applies', async () => {
+    // Only B1 is known; B2 matches no product.
+    prisma.product.findMany.mockResolvedValue([
+      { id: 'p1', barcode: 'B1', name: 'Product 1' },
+    ]);
+
+    const receipt = await service.create(baseDto);
+
+    // Receipt: one matched line, one flagged, and a matching warning.
+    const matched = receipt.lines.find((l) => l.barcode === 'B1');
+    const flagged = receipt.lines.find((l) => l.barcode === 'B2');
+    expect(matched?.matched).toBe(true);
+    expect(flagged?.matched).toBe(false);
+    expect(flagged?.flag).toBe('UNKNOWN_BARCODE');
+    expect(flagged?.description).toBeNull();
+    expect(receipt.warnings).toEqual([
+      { code: 'UNKNOWN_BARCODE', barcode: 'B2' },
+    ]);
+
+    // Persisted line: product_id NULL + is_unmatched true (satisfies the DB CHECK), raw_barcode kept.
+    const unmatchedRow = lineItemsData.find((l) => l.rawBarcode === 'B2');
+    expect(unmatchedRow?.productId).toBeNull();
+    expect(unmatchedRow?.isUnmatched).toBe(true);
+
+    // FX still applied to the unknown line — an unknown product is not free.
+    expect(unmatchedRow?.lineTotalBase.gt(0)).toBe(true);
+
+    // Exactly one scan row, linked to the transaction and to that line item.
+    expect(scanData).toHaveLength(1);
+    expect(scanData[0].rawBarcode).toBe('B2');
+    expect(scanData[0].transactionId).toBe('txn-1');
+    expect(scanData[0].lineItemId).toBe(unmatchedRow?.id);
+  });
+
+  it('every persisted line carries raw_barcode, matched or not', async () => {
+    prisma.product.findMany.mockResolvedValue([
+      { id: 'p1', barcode: 'B1', name: 'Product 1' },
+    ]);
+    await service.create(baseDto);
+    expect(lineItemsData.every((l) => Boolean(l.rawBarcode))).toBe(true);
+  });
+
+  it('empty cart -> 400 EMPTY_CART, before any DB call', async () => {
+    const err = await caught(service.create({ ...baseDto, lineItems: [] }));
+    expect(err.getStatus()).toBe(400);
+    expect((err.getResponse() as { code: string }).code).toBe('EMPTY_CART');
+    expect(prisma.store.findUnique).not.toHaveBeenCalled();
+  });
+
+  it('unknown store -> 404 STORE_NOT_FOUND', async () => {
+    prisma.store.findUnique.mockResolvedValue(null);
+    const err = await caught(service.create(baseDto));
+    expect(err.getStatus()).toBe(404);
+    expect((err.getResponse() as { code: string }).code).toBe(
+      'STORE_NOT_FOUND',
     );
+  });
+
+  it('unsupported currency -> 422 UNSUPPORTED_CURRENCY', async () => {
+    prisma.currency.findUnique.mockResolvedValue(null);
+    const err = await caught(service.create(baseDto));
+    expect(err.getStatus()).toBe(422);
+    expect((err.getResponse() as { code: string }).code).toBe(
+      'UNSUPPORTED_CURRENCY',
+    );
+  });
+
+  it('duplicate (storeId, externalRef) -> 409 DUPLICATE_SALE, no Prisma text leaks', async () => {
+    prisma.$transaction.mockRejectedValue(
+      new Prisma.PrismaClientKnownRequestError('Unique constraint failed', {
+        code: 'P2002',
+        clientVersion: 'test',
+      }),
+    );
+    const err = await caught(
+      service.create({ ...baseDto, externalRef: 'POS-1' }),
+    );
+    expect(err.getStatus()).toBe(409);
+    const body = err.getResponse() as { code: string; message: string };
+    expect(body.code).toBe('DUPLICATE_SALE');
+    expect(body.message).not.toMatch(/constraint|P2002|prisma/i);
   });
 });
