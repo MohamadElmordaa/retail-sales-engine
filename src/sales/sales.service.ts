@@ -1,15 +1,16 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { Prisma } from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { FxService } from '../fx/fx.service';
 import type { CreateSaleDto } from './dto/create-sale.dto';
 import { ReceiptMapper, type SaleReceipt } from './receipt/receipt.mapper';
 
-// Slice 1: identity FX. Every row written here carries this source tag so a real
-// FxService (Slice 2) can grep and backfill them. fxRate = 1, base = txn currency.
-const IDENTITY_FX_SOURCE = 'IDENTITY_V0';
+// Base-currency amounts are rounded once, explicitly, at 4dp (the NUMERIC(14,4) scale).
+const MONEY_SCALE = 4;
+const ROUNDING = Prisma.Decimal.ROUND_HALF_UP;
 
-// A line resolved in memory before it hits the transaction — barcode matched to a
-// product plus the money computed via Decimal (never number).
+// A line resolved in memory before it hits the transaction. Money is Decimal (never
+// number); *_base values are computed at write time from the snapshotted FX rate.
 interface ComputedLine {
   productId: string;
   barcode: string;
@@ -17,11 +18,16 @@ interface ComputedLine {
   quantity: number;
   unitPrice: Prisma.Decimal;
   lineTotal: Prisma.Decimal;
+  unitPriceBase: Prisma.Decimal;
+  lineTotalBase: Prisma.Decimal;
 }
 
 @Injectable()
 export class SalesService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly fx: FxService,
+  ) {}
 
   async create(dto: CreateSaleDto): Promise<SaleReceipt> {
     // 1. Resolve store, cashier, currency. Fail fast.
@@ -39,7 +45,7 @@ export class SalesService {
       throw new NotFoundException('CASHIER_NOT_FOUND');
     }
 
-    // Slice 1 treats an unsupported currency as 404; Slice 4 maps it to 422.
+    // Slice 2 treats an unsupported currency as 404; Slice 4 maps it to 422.
     const currency = await this.prisma.currency.findUnique({
       where: { code: dto.currencyCode },
     });
@@ -47,7 +53,12 @@ export class SalesService {
       throw new NotFoundException('UNSUPPORTED_CURRENCY');
     }
 
-    // 2. Batch-look-up every product in ONE query — no await in a loop (WAN round-trips).
+    // 2. Snapshot the FX rate applied to this sale. A USD sale is not a special case:
+    //    getRate(USD, USD) returns 1.0 via the identical path.
+    const baseCurrency = this.fx.getBaseCurrency();
+    const { rate, source } = this.fx.getRate(currency.code, baseCurrency);
+
+    // 3. Batch-look-up every product in ONE query — no await in a loop (WAN round-trips).
     const barcodes = dto.lineItems.map((item) => item.barcode);
     const products = await this.prisma.product.findMany({
       where: { barcode: { in: barcodes } },
@@ -56,7 +67,7 @@ export class SalesService {
       products.map((product) => [product.barcode, product]),
     );
 
-    // 3. Compute each line. Slice 1 is happy-path: an unknown barcode throws 404.
+    // 4. Compute each line. Slice 2 is still happy-path: an unknown barcode throws 404.
     //    Slice 3 replaces this with the log-and-continue behaviour the brief requires.
     const lines: ComputedLine[] = dto.lineItems.map((item) => {
       const product = productByBarcode.get(item.barcode);
@@ -64,26 +75,39 @@ export class SalesService {
         throw new NotFoundException('UNKNOWN_BARCODE');
       }
       const unitPrice = new Prisma.Decimal(item.unitPrice);
+      const lineTotal = unitPrice.mul(item.quantity);
       return {
         productId: product.id,
         barcode: item.barcode,
         description: product.name,
         quantity: item.quantity,
         unitPrice,
-        lineTotal: unitPrice.mul(item.quantity),
+        lineTotal,
+        // unit_price_base is informational — derive it, don't build totals on it.
+        unitPriceBase: unitPrice
+          .mul(rate)
+          .toDecimalPlaces(MONEY_SCALE, ROUNDING),
+        // line_total_base = lineTotal x rate (NOT unitPriceBase x quantity: that would
+        // round the unit price first and let the error scale with quantity).
+        lineTotalBase: lineTotal
+          .mul(rate)
+          .toDecimalPlaces(MONEY_SCALE, ROUNDING),
       };
     });
 
-    // 4. Totals. All Decimal arithmetic; identity FX means base == transaction currency.
+    // 5. Totals. subtotal/total in transaction currency; totalBase is the SUM of the
+    //    per-line base amounts (NOT total x rate) so the receipt reconciles to its lines.
     const subtotal = lines.reduce(
       (sum, line) => sum.add(line.lineTotal),
       new Prisma.Decimal(0),
     );
     const total = subtotal;
-    const fxRate = new Prisma.Decimal(1);
-    const totalBase = total; // total.mul(fxRate) — identity this slice.
+    const totalBase = lines.reduce(
+      (sum, line) => sum.add(line.lineTotalBase),
+      new Prisma.Decimal(0),
+    );
 
-    // 5. One atomic transaction: header + all line items. All-or-nothing.
+    // 6. One atomic transaction: header + all line items. All-or-nothing.
     const transaction = await this.prisma.$transaction(
       async (tx) => {
         const created = await tx.transaction.create({
@@ -92,9 +116,9 @@ export class SalesService {
             cashierId: cashier.id,
             externalRef: dto.externalRef ?? null,
             currencyCode: currency.code,
-            baseCurrencyCode: currency.code,
-            fxRate,
-            fxRateSource: IDENTITY_FX_SOURCE,
+            baseCurrencyCode: baseCurrency,
+            fxRate: rate,
+            fxRateSource: source,
             subtotal,
             total,
             totalBase,
@@ -111,8 +135,8 @@ export class SalesService {
             quantity: line.quantity,
             unitPrice: line.unitPrice,
             lineTotal: line.lineTotal,
-            unitPriceBase: line.unitPrice, // identity FX
-            lineTotalBase: line.lineTotal, // identity FX
+            unitPriceBase: line.unitPriceBase,
+            lineTotalBase: line.lineTotalBase,
           })),
         });
 
@@ -121,7 +145,7 @@ export class SalesService {
       { timeout: 15_000, maxWait: 5_000 },
     );
 
-    // 6. Shape the receipt. No Prisma model leaves the service.
+    // 7. Shape the receipt. No Prisma model leaves the service.
     return ReceiptMapper.toReceipt({
       transactionId: transaction.id,
       occurredAt: transaction.occurredAt,
@@ -129,9 +153,9 @@ export class SalesService {
       cashier: { id: cashier.id, fullName: cashier.fullName },
       currency: {
         code: currency.code,
-        baseCode: currency.code,
-        fxRate,
-        fxRateSource: IDENTITY_FX_SOURCE,
+        baseCode: baseCurrency,
+        fxRate: rate,
+        fxRateSource: source,
       },
       lines: lines.map((line) => ({
         barcode: line.barcode,
