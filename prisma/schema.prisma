@@ -1,0 +1,181 @@
+// Retail Sales Engine — data model.
+// Source of truth: context/project-overview.md §4. Table/column conventions:
+//   models PascalCase singular, @@map to snake_case plural, columns camelCase -> snake_case.
+//
+// Prisma 7 notes:
+//   - Connection URLs live in prisma.config.ts (datasource.url), NOT here.
+//   - The `prisma-client` generator emits into src/generated/prisma as CommonJS
+//     so NestJS (which builds to CJS) can require it directly.
+//   - Constraints Prisma can't express (partial unique index on external_ref,
+//     CHECK constraints, covering index) are added as raw SQL in the migration.
+
+generator client {
+  provider     = "prisma-client"
+  output       = "../src/generated/prisma"
+  runtime      = "nodejs"
+  moduleFormat = "cjs"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum UserRole {
+  CASHIER
+  MANAGER
+  ADMIN
+
+  @@map("user_role")
+}
+
+model Store {
+  id        String   @id @default(uuid()) @db.Uuid
+  code      String   @unique // human-readable, used by POS clients
+  name      String
+  region    String // reporting dimension (Task 3)
+  createdAt DateTime @default(now()) @db.Timestamptz
+
+  users        User[]
+  transactions Transaction[]
+  scans        UnmatchedBarcodeScan[]
+
+  @@index([region])
+  @@map("stores")
+}
+
+model User {
+  id        String   @id @default(uuid()) @db.Uuid
+  storeId   String   @db.Uuid
+  email     String   @unique
+  fullName  String
+  role      UserRole
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now()) @db.Timestamptz
+
+  store        Store         @relation(fields: [storeId], references: [id], onDelete: Restrict)
+  transactions Transaction[]
+
+  @@index([storeId, role])
+  @@map("users")
+}
+
+model Brand {
+  id       String    @id @default(uuid()) @db.Uuid
+  name     String    @unique
+  products Product[]
+
+  @@map("brands")
+}
+
+model Category {
+  id       String     @id @default(uuid()) @db.Uuid
+  name     String
+  parentId String?    @db.Uuid
+  parent   Category?  @relation("CategoryTree", fields: [parentId], references: [id], onDelete: Restrict)
+  children Category[] @relation("CategoryTree")
+  products Product[]
+
+  @@unique([parentId, name])
+  @@map("categories")
+}
+
+model Currency {
+  code       String  @id @db.Char(3) // ISO 4217; PK is the code itself
+  name       String
+  minorUnits Int     @default(2)
+  isActive   Boolean @default(true)
+
+  transactions Transaction[] @relation("TxnCurrency")
+  baseFor      Transaction[] @relation("TxnBaseCurrency")
+
+  @@map("currencies")
+}
+
+model Product {
+  id          String   @id @default(uuid()) @db.Uuid
+  barcode     String   @unique // EAN/UPC as scanned
+  sku         String   @unique
+  name        String
+  brandId     String?  @db.Uuid
+  categoryId  String?  @db.Uuid
+  externalRef String? // join key -> external data system; partial-unique via raw SQL
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now()) @db.Timestamptz
+  updatedAt   DateTime @updatedAt @db.Timestamptz
+
+  brand     Brand?                @relation(fields: [brandId], references: [id], onDelete: SetNull)
+  category  Category?             @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  lineItems TransactionLineItem[]
+
+  @@index([brandId])
+  @@index([categoryId])
+  @@map("products")
+}
+
+model Transaction {
+  id               String   @id @default(uuid()) @db.Uuid
+  storeId          String   @db.Uuid
+  cashierId        String   @db.Uuid
+  externalRef      String? // client-supplied idempotency / POS ref
+  currencyCode     String   @db.Char(3)
+  baseCurrencyCode String   @db.Char(3)
+  fxRate           Decimal  @db.Decimal(18, 8) // SNAPSHOT — never re-derived
+  fxRateSource     String   @default("HARDCODED_V1")
+  fxCapturedAt     DateTime @default(now()) @db.Timestamptz
+  subtotal         Decimal  @db.Decimal(14, 4) // transaction currency
+  total            Decimal  @db.Decimal(14, 4)
+  totalBase        Decimal  @db.Decimal(14, 4) // total * fxRate, computed at write time
+  occurredAt       DateTime @default(now()) @db.Timestamptz // business time / partition-key candidate
+  createdAt        DateTime @default(now()) @db.Timestamptz // ingest time
+
+  store        Store                  @relation(fields: [storeId], references: [id], onDelete: Restrict)
+  cashier      User                   @relation(fields: [cashierId], references: [id], onDelete: Restrict)
+  currency     Currency               @relation("TxnCurrency", fields: [currencyCode], references: [code])
+  baseCurrency Currency               @relation("TxnBaseCurrency", fields: [baseCurrencyCode], references: [code])
+  lineItems    TransactionLineItem[]
+  scans        UnmatchedBarcodeScan[]
+
+  @@unique([storeId, externalRef])
+  @@index([occurredAt])
+  @@index([storeId, occurredAt])
+  @@map("transactions")
+}
+
+model TransactionLineItem {
+  id                  String  @id @default(uuid()) @db.Uuid
+  transactionId       String  @db.Uuid
+  productId           String? @db.Uuid // NULL => barcode matched nothing
+  rawBarcode          String // always recorded, matched or not
+  isUnmatched         Boolean @default(false)
+  descriptionSnapshot String? // product name at time of sale
+  quantity            Int
+  unitPrice           Decimal @db.Decimal(14, 4)
+  lineTotal           Decimal @db.Decimal(14, 4)
+  unitPriceBase       Decimal @db.Decimal(14, 4)
+  lineTotalBase       Decimal @db.Decimal(14, 4)
+
+  transaction Transaction @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+  product     Product?    @relation(fields: [productId], references: [id], onDelete: Restrict)
+
+  @@index([transactionId])
+  @@index([productId])
+  @@index([rawBarcode])
+  @@map("transaction_line_items")
+}
+
+model UnmatchedBarcodeScan {
+  id            String    @id @default(uuid()) @db.Uuid
+  rawBarcode    String
+  storeId       String    @db.Uuid
+  transactionId String?   @db.Uuid
+  lineItemId    String?   @db.Uuid
+  scannedAt     DateTime  @default(now()) @db.Timestamptz
+  resolvedAt    DateTime? @db.Timestamptz // set when the catalogue gap is closed
+
+  store       Store        @relation(fields: [storeId], references: [id], onDelete: Restrict)
+  transaction Transaction? @relation(fields: [transactionId], references: [id], onDelete: SetNull)
+
+  @@index([rawBarcode])
+  @@index([storeId, scannedAt])
+  @@map("unmatched_barcode_scans")
+}
