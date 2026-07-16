@@ -47,8 +47,7 @@ curl -s -X POST http://localhost:3000/sales \
   -d '{
     "storeCode": "STR-001",
     "cashierId": "<CASHIER_UUID_FROM_SEED_OUTPUT>",
-    "currencyCode": "USD",
-    "externalRef": "POS-DEMO-0001",
+    "currencyCode": "EUR",
     "lineItems": [
       { "barcode": "4006381333931", "quantity": 2, "unitPrice": "3.4900" },
       { "barcode": "4001686301227", "quantity": 1, "unitPrice": "1.9900" }
