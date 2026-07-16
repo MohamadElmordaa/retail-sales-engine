@@ -1,4 +1,4 @@
-import { Body, Controller, Post, ValidationPipe } from '@nestjs/common';
+import { Body, Controller, Post } from '@nestjs/common';
 import { CreateSaleDto } from './dto/create-sale.dto';
 import { SalesService } from './sales.service';
 import type { SaleReceipt } from './receipt/receipt.mapper';
@@ -7,13 +7,10 @@ import type { SaleReceipt } from './receipt/receipt.mapper';
 export class SalesController {
   constructor(private readonly salesService: SalesService) {}
 
-  // Thin: parse -> delegate -> return. No Prisma, no math.
-  // The local pipe runs the DTO decorators and applies @Type transforms this slice;
-  // the global ValidationPipe (whitelist/forbidNonWhitelisted) moves to main.ts in Slice 4.
+  // Thin: parse -> delegate -> return. No Prisma, no math. The global ValidationPipe
+  // (whitelist/forbidNonWhitelisted/transform) in main.ts runs the DTO decorators.
   @Post()
-  create(
-    @Body(new ValidationPipe({ transform: true })) dto: CreateSaleDto,
-  ): Promise<SaleReceipt> {
+  create(@Body() dto: CreateSaleDto): Promise<SaleReceipt> {
     return this.salesService.create(dto);
   }
 }

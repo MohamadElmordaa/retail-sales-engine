@@ -1,6 +1,5 @@
 import { Type } from 'class-transformer';
 import {
-  ArrayNotEmpty,
   IsArray,
   IsOptional,
   IsString,
@@ -9,9 +8,6 @@ import {
 } from 'class-validator';
 import { LineItemDto } from './line-item.dto';
 
-// Slice 1 validation is deliberately minimal — only what stops a crash. The
-// global ValidationPipe (whitelist/forbidNonWhitelisted) and the proper
-// EMPTY_CART / VALIDATION_FAILED envelope are Slice 4's job.
 export class CreateSaleDto {
   @IsString()
   storeCode: string;
@@ -26,10 +22,11 @@ export class CreateSaleDto {
   @IsString()
   externalRef?: string;
 
-  // @ValidateNested + @Type are NOT optional: without them the array is
-  // validated as plain objects and every rule inside LineItemDto silently no-ops.
+  // No @ArrayNotEmpty: an empty cart is its own distinct error (EMPTY_CART, thrown in the
+  // service), not a generic VALIDATION_FAILED. @ArrayNotEmpty would short-circuit at the pipe
+  // and collapse the two. @ValidateNested + @Type stay — without them the array is validated
+  // as plain objects and every rule inside LineItemDto silently no-ops.
   @IsArray()
-  @ArrayNotEmpty()
   @ValidateNested({ each: true })
   @Type(() => LineItemDto)
   lineItems: LineItemDto[];
