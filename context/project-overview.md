@@ -29,7 +29,7 @@ returns, inventory, promotions. **Do not build them.** Note them as future work 
 - **NestJS** (on Express) — modular, DI-first, testable
 - **TypeScript** — `strict: true`, no `any` in committed code
 - **PostgreSQL** — hosted on **Neon** (serverless Postgres, free tier)
-- **Prisma ORM** v6 — schema-first, migration-driven
+- **Prisma ORM** v7 — schema-first, migration-driven
 - **class-validator / class-transformer** — DTO validation at the edge
 - **Jest + Supertest** — unit + e2e
 
@@ -44,10 +44,10 @@ own `DATABASE_URL` — which is fine, because of the next rule.
 > PostgreSQL 16, so `DATABASE_URL` can point at Neon, a local install, or a colleague's
 > box, and nothing changes. Never `import` anything Neon-branded in `src/`.
 
-**Prisma version:** pinned to **v6.x**. In v6 the connection is configured in
-`schema.prisma` via `url` / `directUrl`. Prisma 7 moves this to `prisma.config.ts` and
-changes the client import path — if you upgrade, that's a deliberate migration, not a
-`npm update` accident.
+**Prisma version:** **v7.x**. In v7 the datasource connection lives in `prisma.config.ts`
+(`datasource.url` = `DIRECT_URL` for the CLI), not in `schema.prisma`; the running app
+connects over the pooled `DATABASE_URL` through the `@prisma/adapter-pg` driver adapter in
+`src/prisma/prisma.service.ts`. The generated client is emitted to `src/generated/prisma`.
 
 ---
 
